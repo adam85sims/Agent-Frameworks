@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from mcp.server.fastmcp import FastMCP
 
+from config import get_config
 from models import Pattern, Correction
 from storage import Storage
 from pattern_engine import (
@@ -34,13 +35,15 @@ from pattern_engine import (
 
 # ── Initialize ──────────────────────────────────────────────────────────
 
-# Allow overriding via environment variables for testing
-DB_PATH = os.environ.get("PATTERN_MEMORY_DB", str(Path.home() / ".pattern-memory" / "patterns.db"))
-CHROMA_URL = os.environ.get("PATTERN_MEMORY_CHROMA", "http://127.0.0.1:8000")
-PID_FILE = Path(os.environ.get("PATTERN_MEMORY_PID", str(Path.home() / ".pattern-memory" / "server.pid")))
+_config = get_config()
+PID_FILE = Path(_config["pid_file"])
 
 mcp = FastMCP("pattern-memory")
-storage = Storage(db_path=DB_PATH, chroma_url=CHROMA_URL)
+storage = Storage(
+    db_path=_config["db_path"],
+    chroma_url=_config["chroma_url"],
+    collection_name=_config["collection_name"],
+)
 engine = PatternEngine(storage)
 
 
@@ -438,10 +441,8 @@ def _get_pid_file() -> Path:
 def _check_singleton() -> None:
     """Check for a running instance and exit if found.
 
-    Uses a PID file at PATTERN_MEMORY_PID (default ~/.pattern-memory/server.pid).
-    If the PID file exists and the process is alive, exits with an error.
-    If the PID file exists but the process is stale, removes it and proceeds.
-    On clean startup, writes the current PID to the file.
+    Uses a PID file. If the PID file exists and the process is alive,
+    exits with an error. If stale, removes it and proceeds.
     """
     pid_file = _get_pid_file()
 

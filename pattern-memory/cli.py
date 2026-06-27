@@ -21,14 +21,17 @@ from pathlib import Path
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+from config import get_config
 from storage import Storage
 from pattern_engine import PatternEngine
 
 
 def get_engine() -> PatternEngine:
+    config = get_config()
     storage = Storage(
-        db_path=str(Path.home() / ".pattern-memory" / "patterns.db"),
-        chroma_url="http://127.0.0.1:8000",
+        db_path=config["db_path"],
+        chroma_url=config["chroma_url"],
+        collection_name=config["collection_name"],
     )
     return PatternEngine(storage)
 

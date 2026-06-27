@@ -26,17 +26,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from config import get_config
 from storage import Storage
 from pattern_engine import PatternEngine
 
 
-SESSION_FILE = Path.home() / ".pattern-memory" / "current_session.json"
+_config = get_config()
+SESSION_FILE = Path(_config["session_file"])
 
 
 def get_engine() -> PatternEngine:
     storage = Storage(
-        db_path=str(Path.home() / ".pattern-memory" / "patterns.db"),
-        chroma_url="http://127.0.0.1:8000",
+        db_path=_config["db_path"],
+        chroma_url=_config["chroma_url"],
+        collection_name=_config["collection_name"],
     )
     return PatternEngine(storage)
 
