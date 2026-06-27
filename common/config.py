@@ -67,15 +67,23 @@ DEFAULTS = {
 CONFIG_FILENAME = "agent-frameworks.yaml"
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge override into base. Override wins on conflicts."""
+def deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base. Override wins on conflicts.
+
+    Nested dicts are merged recursively; all other values are replaced.
+    Useful for layering config: defaults -> yaml -> env overrides.
+    """
     result = base.copy()
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = _deep_merge(result[key], value)
+            result[key] = deep_merge(result[key], value)
         else:
             result[key] = value
     return result
+
+
+# Backward-compatible alias (private name used internally)
+_deep_merge = deep_merge
 
 
 def _apply_env_overrides(config: dict) -> dict:

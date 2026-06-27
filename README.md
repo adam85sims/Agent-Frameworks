@@ -126,7 +126,7 @@ result = run_audit(
     output_dir="governance/reports/",
 )
 
-print(f"Verdict: {result.verdent}")
+print(f"Verdict: {result.verdict}")
 for d in result.discrepancies:
     print(f"  [{d.severity}] {d.description}")
 ```

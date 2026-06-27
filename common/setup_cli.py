@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import platform
 import shutil
@@ -21,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("agent-fw.setup")
 
 # ─── Version ──────────────────────────────────────────────────────
 
@@ -111,8 +114,8 @@ class EnvDetector:
                 )
                 if result.stdout.strip():
                     backends["lm-studio"]["models"] = result.stdout.strip()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("LM Studio model query failed: %s", e)
         else:
             backends["lm-studio"] = {"status": "not found"}
 
@@ -131,8 +134,8 @@ class EnvDetector:
                 backends[name.rsplit("-", 1)[0]] = backends.get(name.rsplit("-", 1)[0], {})
                 backends[name.rsplit("-", 1)[0]]["running"] = True
                 backends[name.rsplit("-", 1)[0]]["port"] = port
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Port %d probe failed: %s", port, e)
 
         return backends
 
@@ -152,8 +155,8 @@ class EnvDetector:
                 )
                 if "chroma" in result.stdout.lower():
                     containers["chromadb"] = {"status": "running", "runtime": "podman"}
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Podman query failed: %s", e)
         else:
             containers["podman"] = {"status": "not found"}
 

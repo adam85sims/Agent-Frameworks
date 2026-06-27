@@ -62,7 +62,7 @@ def load_auditor_config(project_root: Path = None) -> dict:
             logger.warning("Failed to parse auditor.yaml: %s", e)
 
     # Merge with defaults
-    config = _deep_merge(_default_config(), yaml_config)
+    config = deep_merge(_default_config(), yaml_config)
 
     # Apply env var overrides
     if ENV_URL in os.environ:
@@ -97,15 +97,7 @@ def _default_config() -> dict:
     }
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge override into base."""
-    result = base.copy()
-    for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = value
-    return result
+from common.config import deep_merge
 
 
 import os  # noqa: E402 (needed for env var access)

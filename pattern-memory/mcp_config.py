@@ -85,8 +85,8 @@ def detect_platforms() -> dict:
                     has_mcp = "mcpServers" in content
                 elif name == "opencode":
                     has_mcp = "mcp" in content.lower()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read %s config: %s", name, e)
 
         platforms[name] = {
             "config_path": config_path,

@@ -37,8 +37,15 @@ def collect_evidence(project_root: str) -> dict:
 
     Returns:
         Dictionary with test results, file timestamps, tool counts, etc.
+
+    Raises:
+        FileNotFoundError: If project_root doesn't exist.
     """
     root = Path(project_root)
+    if not root.exists():
+        raise FileNotFoundError(f"Project root not found: {root}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"Project root is not a directory: {root}")
     config = _get_gov_config(root)
 
     logger.info("Collecting evidence for %s", root)

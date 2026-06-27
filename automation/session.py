@@ -167,7 +167,6 @@ class SessionState:
         if not path.exists():
             return
 
-        import re as _re
         content = path.read_text()
         for line in content.split("\n"):
             # Strip markdown bold markers for cleaner parsing

@@ -38,7 +38,7 @@ def main():
     store = Storage(db_path=db_path, chroma_url="http://127.0.0.1:8000")
     try:
         store.chroma.delete_collection("pattern_memory")
-    except:
+    except Exception:
         pass
     store.collection = store.chroma.get_or_create_collection(
         "pattern_memory", metadata={"hnsw:space": "cosine"}
