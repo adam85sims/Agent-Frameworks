@@ -1,18 +1,39 @@
-"""Pattern Memory — Storage Layer (SQLite + ChromaDB)"""
+"""Pattern Memory — Storage Layer (SQLite + ChromaDB)
+
+Supports two modes:
+  - Full mode: SQLite + ChromaDB (default)
+  - SQLite-only mode: When ChromaDB is unavailable (graceful degradation)
+"""
+
 import json
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import chromadb
-from chromadb.errors import NotFoundError
+from common.logging import get_logger
+
+logger = get_logger("pattern-memory.storage")
+
+# Try to import chromadb — optional dependency
+try:
+    import chromadb
+    from chromadb.errors import NotFoundError
+    HAS_CHROMADB = True
+except ImportError:
+    HAS_CHROMADB = False
+    logger.warning("chromadb not installed — running in SQLite-only mode")
 
 from models import Pattern, Correction
 
 
 class Storage:
-    """Dual storage: SQLite for metadata, ChromaDB for vector search."""
+    """Dual storage: SQLite for metadata, ChromaDB for vector search.
+
+    If ChromaDB is unavailable, falls back to SQLite-only mode.
+    Semantic search will return empty results in SQLite-only mode.
+    """
 
     def __init__(
         self,
@@ -28,27 +49,41 @@ class Storage:
         self.conn.row_factory = sqlite3.Row
         self._init_db()
 
-        # ChromaDB for vector search
-        self.chroma = chromadb.HttpClient(host="127.0.0.1", port=8000)
+        # ChromaDB for vector search (optional)
+        self._chroma_available = False
+        self.chroma = None
+        self.collection = None
         self._collection_name = collection_name
-        self.collection = self._init_collection()
+
+        if HAS_CHROMADB:
+            try:
+                # Parse chroma_url to extract host and port
+                from urllib.parse import urlparse
+                parsed = urlparse(chroma_url)
+                host = parsed.hostname or "127.0.0.1"
+                port = parsed.port or 8000
+                self.chroma = chromadb.HttpClient(host=host, port=port)
+                self._chroma_available = True  # Set BEFORE _init_collection
+                self.collection = self._init_collection()
+            except Exception as e:
+                logger.warning("ChromaDB unavailable: %s — SQLite-only mode", e)
+        else:
+            logger.info("Running in SQLite-only mode (no semantic search)")
 
     def _init_collection(self):
         """Initialize or re-initialize the ChromaDB collection handle."""
+        if not self._chroma_available or self.chroma is None:
+            return None
         return self.chroma.get_or_create_collection(
             name=self._collection_name,
             metadata={"hnsw:space": "cosine"},
         )
 
     def _ensure_collection(self):
-        """Re-initialize collection handle if it's stale.
-
-        ChromaDB collection UUIDs can change when collections are deleted and
-        recreated (e.g., during test isolation cleanup). The old handle becomes
-        invalid. This method catches that and creates a fresh handle.
-        """
+        """Re-initialize collection handle if it's stale."""
+        if not self._chroma_available:
+            return False
         try:
-            # Probe: do a lightweight read to check if the handle is valid
             self.collection.count()
         except (ValueError, NotFoundError) as e:
             error_msg = str(e)
@@ -59,28 +94,18 @@ class Storage:
         return False
 
     def _chroma_op(self, method_name: str, *args, **kwargs):
-        """Execute a ChromaDB operation with self-healing on stale handles.
-
-        Uses method_name (e.g., 'upsert', 'delete', 'query') instead of a
-        bound method reference, so that if the collection handle is replaced
-        (_ensure_collection), the retry uses the NEW handle.
-
-        If the operation fails because the collection doesn't exist (UUID
-        mismatch), re-initialize the handle and retry once.
-        """
+        """Execute a ChromaDB operation with self-healing on stale handles."""
+        if not self._chroma_available or self.collection is None:
+            return None
         operation = getattr(self.collection, method_name)
         try:
             return operation(*args, **kwargs)
         except (ValueError, NotFoundError) as e:
             error_msg = str(e).lower()
-            # Detect stale handle: "collection [uuid] does not exist"
             if "does not exist" in error_msg and "collection" in error_msg:
-                # Self-heal: re-initialize collection handle
                 self._ensure_collection()
-                # Retry once with the NEW collection handle
                 operation = getattr(self.collection, method_name)
                 return operation(*args, **kwargs)
-            # Unexpected error — re-raise
             raise
 
     def _init_db(self):
@@ -141,20 +166,21 @@ class Storage:
         self.conn.commit()
 
         # ChromaDB
-        doc_text = f"{pattern.trigger} → {pattern.action}"
-        self._chroma_op(
-            "upsert",
-            ids=[pattern.id],
-            documents=[doc_text],
-            metadatas=[{
-                "category": pattern.category,
-                "confidence": pattern.confidence,
-                "use_count": pattern.use_count,
-                "created_at": pattern.created_at.isoformat(),
-                "applied_count": pattern.applied_count,
-                "auto_confirmed": pattern.auto_confirmed,
-            }],
-        )
+        if self._chroma_available:
+            doc_text = f"{pattern.trigger} → {pattern.action}"
+            self._chroma_op(
+                "upsert",
+                ids=[pattern.id],
+                documents=[doc_text],
+                metadatas=[{
+                    "category": pattern.category,
+                    "confidence": pattern.confidence,
+                    "use_count": pattern.use_count,
+                    "created_at": pattern.created_at.isoformat(),
+                    "applied_count": pattern.applied_count,
+                    "auto_confirmed": pattern.auto_confirmed,
+                }],
+            )
 
         return pattern.id
 
@@ -185,7 +211,8 @@ class Storage:
         """Delete a pattern from both stores."""
         self.conn.execute("DELETE FROM patterns WHERE id = ?", (pattern_id,))
         self.conn.commit()
-        self._chroma_op("delete", ids=[pattern_id])
+        if self._chroma_available:
+            self._chroma_op("delete", ids=[pattern_id])
 
     def list_patterns(
         self,
@@ -228,12 +255,18 @@ class Storage:
         ]
 
     def search_patterns(self, query: str, limit: int = 10) -> list[dict]:
-        """Semantic search for patterns via ChromaDB."""
-        # Use a safe count that handles stale collection handles
+        """Semantic search for patterns via ChromaDB.
+
+        Returns empty list in SQLite-only mode.
+        """
+        if not self._chroma_available:
+            logger.debug("Semantic search unavailable (SQLite-only mode)")
+            return []
+
         try:
             actual_count = self.collection.count() or 1
         except (ValueError, NotFoundError):
-            actual_count = limit  # fallback: use limit as n_results
+            actual_count = limit
 
         results = self._chroma_op(
             "query",
@@ -241,7 +274,7 @@ class Storage:
             n_results=min(limit, actual_count),
         )
         matches = []
-        if results["ids"] and results["ids"][0]:
+        if results and results["ids"] and results["ids"][0]:
             for i, pid in enumerate(results["ids"][0]):
                 pattern = self.get_pattern(pid)
                 if pattern:
