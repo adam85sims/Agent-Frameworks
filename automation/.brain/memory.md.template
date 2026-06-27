@@ -1,9 +1,21 @@
 # Memory Log (Lessons Learned)
 
-### Learned Decisions
-- **Decision:** [Describe a design choice, e.g., 'Used library X instead of Y because...']
-- **Decision:** [Describe another architecture choice]
+## Architecture Decisions
+| Date | Decision | Reasoning | Revisit? |
+|------|----------|-----------|----------|
+| (none) | | | |
 
-### Gotchas
-- **Gotcha:** [Describe a subtle failure mode or bug that wasted time, e.g., 'Ensure environment variable Z is set to True']
-- **Gotcha:** [Describe another gotcha]
+## Gotchas & Pitfalls
+| Date | Issue | Root Cause | Fix |
+|------|-------|------------|-----|
+| (none) | | | |
+
+## Performance Notes
+| Date | Observation | Metric | Action Taken |
+|------|-------------|--------|--------------|
+| (none) | | | |
+
+## User Preferences
+| Preference | Context | First Noted |
+|------------|---------|-------------|
+| (none) | | |
