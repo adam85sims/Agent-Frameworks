@@ -2,7 +2,7 @@
 """Collect independent evidence about a project's state.
 
 This runs BEFORE any claims are read — pure observation.
-Configurable via governance.yaml.
+Configurable via common.config (agent-frameworks.yaml).
 """
 
 import json
@@ -13,58 +13,35 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-try:
-    import yaml  # type: ignore
-    HAS_YAML = True
-except ImportError:
-    HAS_YAML = False
+from common.config import load_config
+from common.logging import get_logger
+
+logger = get_logger("governance.evidence")
 
 
-def load_governance_config(root: Path) -> dict:
-    """Load governance.yaml. Falls back to safe defaults if missing or PyYAML unavailable."""
-    cfg_path = root / "governance" / "governance.yaml"
-    if not cfg_path.exists():
-        # Try root directory in case of execution from nested dirs
-        cfg_path = root / "governance.yaml"
-        
-    defaults = {
-        "src_dir": "src/pattern-memory",
-        "readme_path": "README.md",
-        "mcp_server_file": "src/pattern-memory/server.py",
-        "diary_dir": "updates",
-        "test_dir": "src/pattern-memory/tests",
-        "test_command": [sys.executable, "-m", "pytest", "tests/", "-v", "--tb=short"],
-        "test_cwd": "src/pattern-memory",
-        "source_file_pattern": "**/*.py"
-    }
+def _get_gov_config(project_root: Path) -> dict:
+    """Load governance section from the common config.
 
-    if not cfg_path.exists():
-        return defaults
-
-    if not HAS_YAML:
-        print(
-            "  WARNING: PyYAML not installed; using built-in defaults. "
-            "Install with: pip install pyyaml",
-            file=sys.stderr,
-        )
-        return defaults
-
-    try:
-        with cfg_path.open() as f:
-            user_cfg = yaml.safe_load(f) or {}
-            # Merge defaults with user config
-            for key, val in user_cfg.items():
-                defaults[key] = val
-            return defaults
-    except Exception as e:
-        print(f"  Error loading governance.yaml: {e}", file=sys.stderr)
-        return defaults
+    Returns the governance section of agent-frameworks.yaml,
+    falling back to safe generic defaults if not configured.
+    """
+    config = load_config(root=project_root)
+    return config.get("governance", {})
 
 
 def collect_evidence(project_root: str) -> dict:
-    """Gather all verifiable facts about the project state."""
+    """Gather all verifiable facts about the project state.
+
+    Args:
+        project_root: Path to the project root directory.
+
+    Returns:
+        Dictionary with test results, file timestamps, tool counts, etc.
+    """
     root = Path(project_root)
-    config = load_governance_config(root)
+    config = _get_gov_config(root)
+
+    logger.info("Collecting evidence for %s", root)
 
     evidence = {
         "collected_at": datetime.now().isoformat(),
@@ -77,19 +54,31 @@ def collect_evidence(project_root: str) -> dict:
         "diary_timestamps": get_diary_timestamps(root, config),
         "source_files": list_source_files(root, config),
     }
+
+    logger.info(
+        "Evidence collected: %d tests passed, %d failed, %d source files",
+        evidence["tests"]["passed"],
+        evidence["tests"]["failed"],
+        len(evidence["source_files"]),
+    )
     return evidence
 
 
 def run_tests(root: Path, config: dict) -> dict:
     """Run the full test suite and capture results."""
-    test_dir = root / config.get("test_dir", "src/pattern-memory/tests")
+    test_dir = root / config.get("test_dir", "tests")
     if not test_dir.exists():
+        logger.warning("Test directory not found: %s", test_dir)
         return {"status": "no_test_dir", "passed": 0, "failed": 0, "errors": []}
 
-    test_cmd = config.get("test_command", [sys.executable, "-m", "pytest", "tests/", "-v", "--tb=short"])
-    cwd_path = root / config.get("test_cwd", "src/pattern-memory")
+    test_cmd = config.get(
+        "test_command",
+        [sys.executable, "-m", "pytest", "tests/", "-v", "--tb=short"],
+    )
+    cwd_path = root / config.get("test_cwd", ".")
 
-    # Run tests
+    logger.info("Running tests: %s (cwd: %s)", " ".join(test_cmd), cwd_path)
+
     try:
         result = subprocess.run(
             test_cmd,
@@ -121,57 +110,72 @@ def run_tests(root: Path, config: dict) -> dict:
             "output": result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout,
         }
     except Exception as e:
+        logger.error("Failed to run tests: %s", e)
         return {
             "exit_code": -999,
             "passed": 0,
             "failed": 0,
             "total": 0,
             "errors": [str(e)],
-            "output": f"Error running tests: {e}"
+            "output": f"Error running tests: {e}",
         }
 
 
 def get_file_timestamps(root: Path, config: dict) -> dict:
     """Get modification times for all source files."""
     timestamps = {}
-    src_dir = root / config.get("src_dir", "src/pattern-memory")
+    src_dir = root / config.get("src_dir", "src")
     pattern = config.get("source_file_pattern", "**/*.py")
-    if src_dir.exists():
-        # Handle case where pattern is recursive or simple glob
-        glob_iter = src_dir.rglob(pattern.replace("**/", "")) if pattern.startswith("**/") else src_dir.glob(pattern)
-        for f in sorted(glob_iter):
-            if "__pycache__" in str(f) or ".git" in str(f):
-                continue
-            if f.is_dir():
-                continue
-            stat = f.stat()
-            timestamps[str(f.relative_to(root))] = {
-                "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                "ctime": datetime.fromtimestamp(stat.st_ctime).isoformat(),
-                "size": stat.st_size,
-            }
+
+    if not src_dir.exists():
+        logger.warning("Source directory not found: %s", src_dir)
+        return timestamps
+
+    # Handle recursive glob patterns
+    glob_iter = (
+        src_dir.rglob(pattern.replace("**/", ""))
+        if pattern.startswith("**/")
+        else src_dir.glob(pattern)
+    )
+
+    for f in sorted(glob_iter):
+        if "__pycache__" in str(f) or ".git" in str(f):
+            continue
+        if f.is_dir():
+            continue
+        stat = f.stat()
+        timestamps[str(f.relative_to(root))] = {
+            "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            "ctime": datetime.fromtimestamp(stat.st_ctime).isoformat(),
+            "size": stat.st_size,
+        }
     return timestamps
 
 
 def count_mcp_tools(root: Path, config: dict) -> int:
-    """Count actual MCP tool definitions in the server file."""
-    server_py = root / config.get("mcp_server_file", "src/pattern-memory/server.py")
+    """Count actual MCP tool definitions in the server file.
+
+    Returns 0 if mcp_server_file is not configured or doesn't exist.
+    """
+    server_file = config.get("mcp_server_file")
+    if not server_file:
+        return 0
+
+    server_py = root / server_file
     if not server_py.exists():
         return 0
 
     content = server_py.read_text()
-    # Count @mcp.tool() decorators
     return len(re.findall(r"@mcp\.tool\(\)", content))
 
 
 def count_test_functions(root: Path, config: dict) -> int:
     """Count actual test functions in test files."""
-    test_dir = root / config.get("test_dir", "src/pattern-memory/tests")
+    test_dir = root / config.get("test_dir", "tests")
     if not test_dir.exists():
         return 0
 
     count = 0
-    # Scan files matching test_*.py
     for f in test_dir.rglob("test_*.py"):
         if f.is_dir():
             continue
@@ -182,11 +186,11 @@ def count_test_functions(root: Path, config: dict) -> int:
 
 def analyze_readme(root: Path, config: dict) -> dict:
     """Check what the README claims vs reality."""
-    readme = root / config.get("readme_path", "README.md")
-    if not readme.exists():
+    readme_path = root / config.get("readme_path", "README.md")
+    if not readme_path.exists():
         return {"exists": False}
 
-    content = readme.read_text()
+    content = readme_path.read_text()
     # Extract claimed test count
     test_claim = re.search(r"(\d+)/\d+\s*(?:tests?|passing)", content)
     # Extract claimed tool count (first match in main content)
@@ -204,9 +208,6 @@ def get_diary_timestamps(root: Path, config: dict) -> dict:
     """Get file system timestamps for all diary entries."""
     diary_dir = root / config.get("diary_dir", "updates")
     if not diary_dir.exists():
-        # Fallback to updates-for-adam
-        diary_dir = root / "updates-for-adam"
-    if not diary_dir.exists():
         return {}
 
     timestamps = {}
@@ -222,13 +223,19 @@ def get_diary_timestamps(root: Path, config: dict) -> dict:
 
 def list_source_files(root: Path, config: dict) -> list:
     """List all source files."""
-    src_dir = root / config.get("src_dir", "src/pattern-memory")
+    src_dir = root / config.get("src_dir", "src")
     pattern = config.get("source_file_pattern", "**/*.py")
+
     if not src_dir.exists():
         return []
 
     files = []
-    glob_iter = src_dir.rglob(pattern.replace("**/", "")) if pattern.startswith("**/") else src_dir.glob(pattern)
+    glob_iter = (
+        src_dir.rglob(pattern.replace("**/", ""))
+        if pattern.startswith("**/")
+        else src_dir.glob(pattern)
+    )
+
     for f in sorted(glob_iter):
         if "__pycache__" in str(f) or ".git" in str(f):
             continue
