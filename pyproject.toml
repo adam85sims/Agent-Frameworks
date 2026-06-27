@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-frameworks"
+version = "0.1.0"
+description = "Reusable frameworks for building and managing autonomous AI agents"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Hermes Project" },
+]
+dependencies = []
+
+[project.optional-dependencies]
+governance = ["pyyaml>=6.0"]
+pattern-memory = ["mcp>=1.0.0", "chromadb>=0.5.0"]
+dev = ["pytest>=7.0"]
+all = [
+    "pyyaml>=6.0",
+    "mcp>=1.0.0",
+    "chromadb>=0.5.0",
+    "pytest>=7.0",
+]
+
+[project.scripts]
+agent-fw-audit = "governance.audit:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["common", "governance"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
