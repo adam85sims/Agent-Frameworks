@@ -123,7 +123,7 @@ def extract_findings(report: str, claims: dict = None,
             })
 
     # 4. Deterministic comparator — always runs, even if model emitted JSON
-    if claims and evidence:
+    if claims is not None and evidence is not None:
         _add_comparator_findings(findings, claims, evidence)
 
     # 5. Verdict from combined findings

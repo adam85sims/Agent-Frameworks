@@ -84,8 +84,12 @@ def extract_version(text: str) -> str:
 
 
 def extract_tools_count(text: str) -> int:
-    """Extract claimed MCP tool count (last mention = current state)."""
-    matches = re.findall(r"(\d+)\s*\w*\s*(?:MCP\s*)?tools?", text, re.IGNORECASE)
+    r"""Extract claimed MCP tool count (last mention = current state).
+
+    Uses [^\S\n] instead of \s* to avoid bridging across newlines
+    (e.g., matching "0" from "v0.13.0" across a line break to "13 MCP tools").
+    """
+    matches = re.findall(r"(\d+)[^\S\n]*\w*[^\S\n]*(?:MCP[^\S\n]*)?tools?", text, re.IGNORECASE)
     return int(matches[-1]) if matches else 0
 
 
