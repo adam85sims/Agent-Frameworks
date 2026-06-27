@@ -1,0 +1,9 @@
+# Memory Log (Lessons Learned)
+
+### Learned Decisions
+- **Decision:** [Describe a design choice, e.g., 'Used library X instead of Y because...']
+- **Decision:** [Describe another architecture choice]
+
+### Gotchas
+- **Gotcha:** [Describe a subtle failure mode or bug that wasted time, e.g., 'Ensure environment variable Z is set to True']
+- **Gotcha:** [Describe another gotcha]
