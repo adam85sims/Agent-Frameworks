@@ -27,6 +27,7 @@ all = [
 
 [project.scripts]
 agent-fw-audit = "governance.audit:main"
+agent-fw-setup = "common.setup_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["common", "governance"]
