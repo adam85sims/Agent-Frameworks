@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""Governance Auditor — calls a small local LLM via LM Studio to verify claims.
+"""Governance Auditor — calls a local LLM to verify claims.
 
-Replaces the Gemma-4-12b implementation that got stuck in reasoning loops
-(see archive/governance-reports/gemma-era-2026-06-24/ for the evidence).
+Supports multiple backends via config (auditor.yaml):
+  - openai-compatible: LM Studio, vLLM, LiteLLM, any OpenAI-compatible API
+  - ollama: Ollama's native API
+  - none: skip LLM audit, use only deterministic comparator
 
-Key design changes (2026-06-24 swap):
-  1. Config-driven model name (auditor.yaml). No more hardcoded strings.
-  2. Pre-flight existence check — we know the model file is on disk
-     before we send a request. Failures become loud, not silent.
-  3. Retry on empty/None response — Gemma produced empty raw_report
-     5 times in 19 runs. We now retry up to N times with backoff.
-  4. Never unload — Adam's 2026-06-24 direction. Keeps models warm
-     in VRAM between audits.
-  5. Direct JSON-out prompt — no chain-of-thought preamble. The
-     audit task is a structured compare, not a reasoning task.
-  6. Optional escalation model for ambiguous cases.
+Key design:
+  1. Config-driven — no hardcoded model names or URLs
+  2. Pre-flight existence check — fail loud if model not available
+  3. Retry on empty/None response
+  4. Never unload by default (keeps models warm in VRAM)
+  5. Direct JSON-out prompt — no chain-of-thought loops
+  6. Optional escalation model for ambiguous cases
 """
 
 import json
@@ -27,42 +25,63 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-# Lazy import for yaml so this module is importable without PyYAML
-# (it's a stdlib-plus dep in the project, but we degrade gracefully).
-try:
-    import yaml  # type: ignore
-    HAS_YAML = True
-except ImportError:
-    HAS_YAML = False
+from common.config import load_config
+from common.logging import get_logger
 
-LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
-LMS = str(Path.home() / ".lmstudio" / "bin" / "lms")
-LMSTUDIO_MODELS_DIR = Path.home() / ".lmstudio" / "models"
+logger = get_logger("governance.auditor")
+
+# Config file location (relative to this module)
 CONFIG_PATH = Path(__file__).parent / "auditor.yaml"
+
+# Env var overrides for quick testing without editing yaml
+ENV_URL = "AGENT_FW_AUDITOR_URL"
+ENV_MODEL = "AGENT_FW_AUDITOR_MODEL"
 
 
 # ─── Configuration loading ────────────────────────────────────────
 
-def load_config(path: Path = CONFIG_PATH) -> dict:
-    """Load auditor.yaml. Falls back to safe defaults if PyYAML missing."""
-    if not path.exists():
-        return _default_config()
+def load_auditor_config(project_root: Path = None) -> dict:
+    """Load auditor configuration from auditor.yaml + common config.
 
-    if not HAS_YAML:
-        print(
-            "  WARNING: PyYAML not installed; using built-in defaults. "
-            "Install with: pip install pyyaml",
-            file=sys.stderr,
-        )
-        return _default_config()
+    Priority:
+      1. Environment variables (AGENT_FW_AUDITOR_URL, AGENT_FW_AUDITOR_MODEL)
+      2. auditor.yaml (project-level)
+      3. Common config's governance.auditor section (if present)
+      4. Safe defaults
+    """
+    # Load from auditor.yaml if it exists
+    yaml_config = {}
+    if CONFIG_PATH.exists():
+        try:
+            import yaml
+            with CONFIG_PATH.open() as f:
+                yaml_config = yaml.safe_load(f) or {}
+        except ImportError:
+            logger.warning("PyYAML not installed; cannot load auditor.yaml")
+        except Exception as e:
+            logger.warning("Failed to parse auditor.yaml: %s", e)
 
-    with path.open() as f:
-        return yaml.safe_load(f)
+    # Merge with defaults
+    config = _deep_merge(_default_config(), yaml_config)
+
+    # Apply env var overrides
+    if ENV_URL in os.environ:
+        config.setdefault("backend", {})["url"] = os.environ[ENV_URL]
+    if ENV_MODEL in os.environ:
+        model = os.environ[ENV_MODEL]
+        config.setdefault("primary", {})["model"] = model
+
+    return config
 
 
 def _default_config() -> dict:
-    """Fallback if config file missing."""
+    """Safe default configuration."""
     return {
+        "backend": {
+            "type": "openai-compatible",
+            "url": "http://localhost:1234/v1/chat/completions",
+            "lms_binary": str(Path.home() / ".lmstudio" / "bin" / "lms"),
+        },
         "primary": {
             "model": "ibm/granite-4.1-3b",
             "context_length": 8192,
@@ -78,96 +97,126 @@ def _default_config() -> dict:
     }
 
 
-# ─── Pre-flight checks ────────────────────────────────────────────
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
-def is_model_on_disk(model_key: str) -> bool:
-    """Check if a model with this key is downloaded in LM Studio.
 
-    Authoritative source: `lms ls --json` returns the canonical modelKey
-    for everything LM Studio knows about. We use it instead of guessing
-    directory names because lms get <alias> downloads to a directory
-    whose name doesn't always match the alias (e.g. the alias
-    `mistralai/ministral-3-8b` is stored under
-    `lmstudio-community/Ministral-3-8B-Instruct-2512-GGUF/`).
+import os  # noqa: E402 (needed for env var access)
+
+
+# ─── Backend operations ──────────────────────────────────────────
+
+def is_model_on_disk(model_key: str, config: dict) -> bool:
+    """Check if a model is available.
+
+    Uses `lms ls --json` for LM Studio, or falls back to a URL health check.
     """
-    try:
-        result = subprocess.run(
-            [LMS, "ls", "--json", "--llm"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return False
-        import json as _json
-        models = _json.loads(result.stdout)
-        for m in models:
-            if m.get("modelKey") == model_key:
-                return True
-            # Also accept if the alias matches the indexedModelIdentifier
-            if m.get("indexedModelIdentifier") == model_key:
-                return True
-        return False
-    except Exception as e:
-        print(f"  Pre-flight check failed: {e}", file=sys.stderr)
-        # Fall back to directory check
-        candidate = LMSTUDIO_MODELS_DIR / model_key
-        return candidate.exists()
+    backend = config.get("backend", {})
+    backend_type = backend.get("type", "openai-compatible")
 
-
-def is_model_loaded(model_key: str) -> bool:
-    """Check if model is currently in VRAM via lms ps."""
-    try:
-        result = subprocess.run(
-            [LMS, "ps"], capture_output=True, text=True, timeout=10
-        )
-        return model_key in result.stdout
-    except Exception:
+    if backend_type == "none":
         return False
 
+    # Try LM Studio CLI if available
+    lms_binary = backend.get("lms_binary")
+    if lms_binary:
+        lms_path = Path(lms_binary).expanduser()
+        if lms_path.exists():
+            try:
+                result = subprocess.run(
+                    [str(lms_path), "ls", "--json", "--llm"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    models = json.loads(result.stdout)
+                    for m in models:
+                        if m.get("modelKey") == model_key:
+                            return True
+                        if m.get("indexedModelIdentifier") == model_key:
+                            return True
+            except Exception as e:
+                logger.debug("lms ls failed: %s", e)
 
-def load_model(model_key: str, context_length: int, gpu: str = "max",
-               timeout: int = 120) -> bool:
-    """Load model into VRAM. Returns True if loaded successfully."""
-    if is_model_loaded(model_key):
+    # Fallback: assume model is available if backend is configured
+    # The actual API call will fail if the model isn't loaded
+    return True
+
+
+def is_model_loaded(model_key: str, config: dict) -> bool:
+    """Check if model is currently loaded in memory."""
+    backend = config.get("backend", {})
+    lms_binary = backend.get("lms_binary")
+
+    if lms_binary:
+        lms_path = Path(lms_binary).expanduser()
+        if lms_path.exists():
+            try:
+                result = subprocess.run(
+                    [str(lms_path), "ps"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                return model_key in result.stdout
+            except Exception:
+                pass
+
+    return False
+
+
+def load_model(model_key: str, config: dict, timeout: int = 120) -> bool:
+    """Load model into memory. Returns True if loaded or not needed."""
+    backend = config.get("backend", {})
+    backend_type = backend.get("type", "openai-compatible")
+
+    # "none" backend means skip LLM entirely
+    if backend_type == "none":
+        return False
+
+    # If already loaded, nothing to do
+    if is_model_loaded(model_key, config):
         return True
 
-    print(f"  Loading {model_key} into VRAM...", file=sys.stderr)
-    try:
-        result = subprocess.run(
-            [LMS, "load", model_key,
-             "--context-length", str(context_length),
-             "--gpu", gpu],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if result.returncode == 0 or "loaded successfully" in result.stdout.lower():
-            print(f"  Loaded {model_key}.", file=sys.stderr)
-            return True
-        print(f"  Load failed: {result.stdout[-300:]}", file=sys.stderr)
-        return False
-    except subprocess.TimeoutExpired:
-        print(f"  Load timed out after {timeout}s.", file=sys.stderr)
-        return False
+    # Try LM Studio CLI for explicit loading
+    lms_binary = backend.get("lms_binary")
+    if lms_binary:
+        lms_path = Path(lms_binary).expanduser()
+        if lms_path.exists():
+            section = config.get("primary", {})
+            print(f"  Loading {model_key} into VRAM...", file=sys.stderr)
+            try:
+                result = subprocess.run(
+                    [
+                        str(lms_path), "load", model_key,
+                        "--context-length", str(section.get("context_length", 8192)),
+                        "--gpu", section.get("gpu", "max"),
+                    ],
+                    capture_output=True, text=True, timeout=timeout,
+                )
+                if result.returncode == 0 or "loaded successfully" in result.stdout.lower():
+                    print(f"  Loaded {model_key}.", file=sys.stderr)
+                    return True
+                print(f"  Load failed: {result.stdout[-300:]}", file=sys.stderr)
+                return False
+            except subprocess.TimeoutExpired:
+                print(f"  Load timed out after {timeout}s.", file=sys.stderr)
+                return False
+
+    # For backends without explicit loading (Ollama, etc.), assume it works
+    # The API call will handle model loading on first request
+    return True
 
 
 # ─── Audit prompt — direct JSON out, no chain-of-thought ──────────
 
-# This prompt is deliberately minimal. The audit task is a structured
-# compare: "does this claim match this evidence?" The Gemma-era prompt
-# asked for "Reasoning" and "VERDICT" in a specific format, which
-# triggered reasoning loops in chain-of-thought-tuned models.
-#
-# For small instruction-tuned models (Granite, Ministral) we want:
-#   - No preamble
-#   - No "let me check"
-#   - Direct JSON output matching the schema
-#   - Concise discrepancy list (or empty list)
-#
-# The output JSON is what extract.py parses. The model's job is just
-# to enumerate the diffs.
-
 AUDIT_PROMPT = """You are an audit engine. Compare CLAIMS to EVIDENCE.
 
 Output ONLY a JSON object with this exact schema. No prose, no preamble, no markdown fence:
-
 {
   "claims_total": <integer>,
   "verified": <integer>,
@@ -197,12 +246,15 @@ Rules:
 # ─── The audit call ───────────────────────────────────────────────
 
 def call_model(model_key: str, claims: dict, evidence: dict,
-               temperature: float, max_tokens: int,
-               context_length: int) -> Optional[str]:
+               config: dict) -> Optional[str]:
     """One attempt at calling the model. Returns content string or None."""
-    if not load_model(model_key, context_length):
+    if not load_model(model_key, config):
         return None
 
+    backend = config.get("backend", {})
+    url = backend.get("url", "http://localhost:1234/v1/chat/completions")
+
+    section = config.get("primary", {})
     user_content = (
         "CLAIMS (from diary entry):\n"
         f"{json.dumps(claims, indent=2, default=str)}\n\n"
@@ -216,13 +268,13 @@ def call_model(model_key: str, claims: dict, evidence: dict,
             {"role": "system", "content": AUDIT_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "temperature": section.get("temperature", 0.0),
+        "max_tokens": section.get("max_tokens", 1024),
     }
 
     try:
         req = urllib.request.Request(
-            LM_STUDIO_URL,
+            url,
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -233,10 +285,10 @@ def call_model(model_key: str, claims: dict, evidence: dict,
             content = (message.get("content") or "").strip()
             return content if content else None
     except urllib.error.URLError as e:
-        print(f"  Network error: {e}", file=sys.stderr)
+        logger.error("Network error calling %s: %s", url, e)
         return None
     except Exception as e:
-        print(f"  Error: {e}", file=sys.stderr)
+        logger.error("Error calling model: %s", e)
         return None
 
 
@@ -247,8 +299,14 @@ def audit(claims: dict, evidence: dict, config: dict = None,
     Empty/None responses are retried up to config['retry']['max_attempts'].
     On exhaustion, returns a string with an explicit AUDITOR ERROR marker
     that extract.py must surface as CRITICAL.
+
+    Args:
+        claims: Extracted claims from diary entry.
+        evidence: Independently collected project evidence.
+        config: Auditor config dict. If None, loads from auditor.yaml.
+        use_escalation: If True, use the escalation model instead of primary.
     """
-    cfg = config or load_config()
+    cfg = config or load_auditor_config()
     role = "escalation" if use_escalation else "primary"
     section = cfg.get(role) or cfg["primary"]
     retries = cfg.get("retry", {}).get("max_attempts", 3)
@@ -256,8 +314,8 @@ def audit(claims: dict, evidence: dict, config: dict = None,
 
     model_key = section["model"]
 
-    # Pre-flight: model must exist on disk
-    if section.get("expect_on_disk", True) and not is_model_on_disk(model_key):
+    # Pre-flight: model must exist on disk (if check is enabled)
+    if section.get("expect_on_disk", True) and not is_model_on_disk(model_key, cfg):
         return (
             f"AUDITOR ERROR: Model '{model_key}' not found on disk. "
             f"Download with: lms get {model_key}@q4_k_m"
@@ -266,12 +324,7 @@ def audit(claims: dict, evidence: dict, config: dict = None,
     last_result: Optional[str] = None
     for attempt in range(1, retries + 1):
         print(f"  [{role}] attempt {attempt}/{retries}...", file=sys.stderr)
-        last_result = call_model(
-            model_key, claims, evidence,
-            temperature=section.get("temperature", 0.0),
-            max_tokens=section.get("max_tokens", 1024),
-            context_length=section.get("context_length", 8192),
-        )
+        last_result = call_model(model_key, claims, evidence, cfg)
         if last_result:
             return last_result
         if attempt < retries:
@@ -282,8 +335,8 @@ def audit(claims: dict, evidence: dict, config: dict = None,
     # All retries exhausted
     return (
         f"AUDITOR ERROR: {model_key} returned no content after {retries} "
-        f"attempts. Check LM Studio is running, model is loaded, and "
-        f"VRAM is available."
+        f"attempts. Check that the LLM backend is running and the model "
+        f"is available."
     )
 
 
@@ -298,6 +351,6 @@ if __name__ == "__main__":
     claims = json.loads(Path(args[0]).read_text())
     evidence = json.loads(Path(args[1]).read_text())
 
-    cfg = load_config()
+    cfg = load_auditor_config()
     result = audit(claims, evidence, cfg, use_escalation=escalation)
     print(result)

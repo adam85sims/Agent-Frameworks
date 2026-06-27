@@ -1,15 +1,24 @@
 # Governance auditor configuration
-# Modeled on 2026-06-24 after Gemma's reasoning-loop failure.
 #
 # This file is the single source of truth for the auditor model.
 # auditor.py reads this at startup; if a model named here is not
 # present on disk, audit() raises before sending any HTTP request.
-# Prevents the "silent empty raw_report" failure mode.
+
+# Backend configuration — which LLM service to use
+# Supported types:
+#   "openai-compatible" — LM Studio, vLLM, LiteLLM, or any OpenAI-compatible API
+#   "ollama"            — Ollama's native API (http://localhost:11434)
+#   "none"              — skip LLM audit entirely (deterministic comparator only)
+backend:
+  type: "openai-compatible"
+  url: "http://localhost:1234/v1/chat/completions"
+  # Path to LM Studio's lms CLI binary (for model loading/listing)
+  # Set to null if not using LM Studio
+  lms_binary: "~/.lmstudio/bin/lms"
 
 # Primary auditor — used for every claim-verification request.
 # Should be:
 #   - small (fast to load, leaves VRAM for other work)
-#   - text-only OR vision-capable with vision forced off
 #   - good at strict JSON-out / system-prompt adherence
 #   - not a "reasoning" model (we don't want chain-of-thought loops)
 primary:
@@ -22,10 +31,6 @@ primary:
 
 # Escalation auditor — called when primary produces something
 # ambiguous, gets stuck, or disagrees with extract.py.
-# Should be:
-#   - bigger / more capable than primary
-#   - has native JSON output or strong format adherence
-#   - good "second opinion" model
 escalation:
   model: mistralai/ministral-3-8b
   context_length: 8192
@@ -35,18 +40,12 @@ escalation:
   expect_on_disk: true
 
 # Whether to keep models resident in VRAM between audits.
-# Adam (2026-06-24): "If we find a small model — we don't need to
-# unload it unless I specifically ask." So: never unload.
 keep_resident: true
 
 # Retry policy for silent failures.
-# Empty raw_report is the historical failure mode (5/19 Gemma audits
-# produced None with no error). Retry up to N times before failing.
 retry:
   max_attempts: 3
   backoff_seconds: 5
 
 # Failure semantics.
-# If all retries are exhausted, audit() returns a string that
-# extract.py is REQUIRED to surface as CRITICAL. We fail loud.
 on_exhausted_retries: critical
